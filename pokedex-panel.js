@@ -1,6 +1,6 @@
 //@name pokedex_party_panel
 //@api 3.0
-//@version 1.1.1
+//@version 1.1.2
 //@display-name 포켓몬 파티 패널
 //@update-url https://raw.githubusercontent.com/sat7312/pokedex-party-panel/main/pokedex-panel.js
 //@link https://github.com/sat7312/pokedex-party-panel 사용 설명서
@@ -152,6 +152,73 @@
     return keys;
   }
 
+  // ---------- 폼 이름 유추 ----------
+  // 이름 속 종족명을 빼고 남은 말로 그 종의 모습을 찾는다.
+  // 예: "버드렉스(백마)" -> calyrexice, "Calyrex Ice Rider" -> calyrexice, "기라티나 오리진" -> giratinaorigin
+
+  let baseNameIndex = null;   // { ko: [[한국어 종족명, 도감번호]], en: [[영문 키, 도감번호]] } 긴 이름 우선
+  const fuzzyCache = new Map();
+
+  function getBaseNameIndex() {
+    if (baseNameIndex) return baseNameIndex;
+    const ko = [];
+    const en = new Map();
+    for (const [name, key] of Object.entries(DEX_DATA.k)) {
+      const real = DEX_DATA.s[key] ?? key;
+      const row = DEX_DATA.m[real];
+      if (!row || DEX_DATA.f[real]) continue;   // 기본 모습만
+      ko.push([name, row[1]]);
+      en.set(key, row[1]);
+    }
+    const byLength = (a, b) => b[0].length - a[0].length;
+    baseNameIndex = { ko: ko.sort(byLength), en: [...en.entries()].sort(byLength) };
+    return baseNameIndex;
+  }
+
+  function formCore(key) {
+    return formLabel(key).replace(/\s|의\s*모습|모습|폼/g, '');
+  }
+
+  // dex의 모습들 중 rest와 가장 잘 맞는 것. 영어는 Showdown 접미사, 한국어는 폼 이름으로 비교
+  function matchForm(dex, rest, lang) {
+    let best = null;
+    let bestLength = 0;
+    for (const key of formsOf(dex)) {
+      const token = lang === 'en'
+        ? showdownName(DEX_DATA.f[key][0].split('-').slice(1).join(''))
+        : formCore(key);
+      if (!token) continue;
+      const hit = lang === 'en'
+        ? rest.includes(token) || (rest.length >= 3 && token.includes(rest))
+        : token.includes(rest) || rest.includes(token);
+      if (hit && token.length > bestLength) { best = key; bestLength = token.length; }
+    }
+    return best;
+  }
+
+  function fuzzyFormKey(name, englishName) {
+    const cacheKey = `${name}|${englishName}`;
+    if (fuzzyCache.has(cacheKey)) return fuzzyCache.get(cacheKey);
+    const index = getBaseNameIndex();
+    let result = null;
+
+    const en = showdownName(englishName);
+    if (en) {
+      const hit = index.en.find(([k]) => en !== k && en.includes(k));
+      if (hit) result = matchForm(hit[1], en.replace(hit[0], ''), 'en');
+    }
+    if (!result) {
+      const ko = String(name ?? '').replace(/\s/g, '');
+      const hit = index.ko.find(([n]) => ko !== n && ko.includes(n));
+      if (hit) {
+        const rest = ko.replace(hit[0], '').replace(/[()（）[\]·\-_,]|의모습|모습|폼|의$/g, '');
+        if (rest) result = matchForm(hit[1], rest, 'ko');
+      }
+    }
+    fuzzyCache.set(cacheKey, result);
+    return result;
+  }
+
   function formLabel(key) {
     const info = DEX_DATA.f[key];
     if (!info) return '';
@@ -168,7 +235,8 @@
       mon?.form || null,                                  // 1) 직접 고른 모습
       ...koreanFormCandidates(mon?.name, englishKeys),    // 2) 이름에 들어 있는 폼 힌트
       ...englishKeys,                                     // 3) 영문명
-      koKey,                                              // 4) 한국어 이름
+      fuzzyFormKey(mon?.name, mon?.englishName),          // 4) 종족명 + 폼을 가리키는 말
+      koKey,                                              // 5) 한국어 이름
     ].filter(Boolean);
     for (const key of candidates) {
       if (speciesCache.has(key)) return speciesCache.get(key);

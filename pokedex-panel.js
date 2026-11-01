@@ -1,6 +1,6 @@
 //@name pokedex_party_panel
 //@api 3.0
-//@version 1.2.0
+//@version 1.2.1
 //@display-name 포켓몬 파티 패널
 //@update-url https://raw.githubusercontent.com/sat7312/pokedex-party-panel/main/pokedex-panel.js
 //@link https://github.com/sat7312/pokedex-party-panel 사용 설명서
@@ -590,6 +590,7 @@
         version: 1,
         party: (parsed.party ?? []).map(normalizeMon),
         box: (parsed.box ?? []).map(normalizeMon),
+        customShiny: parsed.customShiny ?? null,
       };
     } catch (err) {
       console.log(`[pokedex] 저장 데이터를 읽지 못함: ${err.message}`);
@@ -701,6 +702,51 @@
   }
 
   // 봇 보관함 변수: "이름^레벨^영문명|이름^레벨^영문명|..."
+  // 시작할 때 적는 소지 포켓몬 입력칸 (예: "이로치 리자몽, 피카츄 Lv.10")
+  const BOT_CUSTOM_VAR = '$yp_CustomPokemon';
+
+  // 입력칸에서 이로치 표시가 붙은 포켓몬만 골라 도감 번호로 돌려준다
+  function parseCustomShiny(chat) {
+    const raw = chat?.scriptstate?.[BOT_CUSTOM_VAR];
+    if (typeof raw !== 'string' || !hasShinyMark(raw)) return null;
+    const entries = [];
+    for (const part of raw.split(/[,，、\n/|·;]+/)) {
+      if (!hasShinyMark(part)) continue;
+      const cleaned = stripShinyMark(part)
+        .replace(/(?:lv|레벨)\.?\s*\d+/gi, '')
+        .replace(/\d+/g, '')
+        .replace(/[()[\]{}]/g, ' ')
+        .trim();
+      const species = lookupSpecies({ name: cleaned, englishName: cleaned });
+      if (species) entries.push(species.dex);
+    }
+    return entries.length ? { source: raw, dexes: entries } : null;
+  }
+
+  // 입력칸의 이로치를 시작 파티에 한 번만 반영한다.
+  // 시작 파티가 처음 동기화될 때 짝을 맞추고 닫아서, 나중에 같은 종을 또 잡아도 이로치가 되지 않게 한다.
+  function applyCustomShiny(state, custom) {
+    if (!custom) return 0;
+    if (state.customShiny?.source !== custom.source) state.customShiny = { source: custom.source, closed: false };
+    if (state.customShiny.closed) return 0;
+    const mons = [...state.party, ...state.box];
+    if (!mons.length) return 0;   // 시작 파티가 아직 안 나왔으면 다음 동기화 때 시도
+
+    const pending = custom.dexes.map((dex) => ({ dex, done: false }));
+    let marked = 0;
+    const tryMatch = (test) => {
+      for (const entry of pending) {
+        if (entry.done) continue;
+        const target = mons.find((m) => !m.shiny && test(lookupSpecies(m)?.dex, entry.dex));
+        if (target) { target.shiny = true; entry.done = true; marked += 1; }
+      }
+    };
+    tryMatch((d, dex) => d === dex);                         // 1) 같은 종
+    tryMatch((d, dex) => isPreEvolution(dex, d));            // 2) 이미 진화한 경우 같은 계통
+    state.customShiny.closed = true;
+    return marked;
+  }
+
   function parseBotStorage(chat) {
     const raw = chat?.scriptstate?.[BOT_STORAGE_VAR];
     if (typeof raw !== 'string' || !raw.trim()) return [];
@@ -751,7 +797,7 @@
   }
 
   function isUntouched(mon) {
-    return !mon.item && !mon.memo && !mon.image
+    return !mon.item && !mon.memo && !mon.image && !mon.shiny
       && mon.moves.every((m) => !m.name)
       && (!mon.ability || mon.abilityAuto);
   }
@@ -770,7 +816,7 @@
     return raw || entry?.englishName || '';
   }
 
-  function applySync(state, partyTags, storageEntries) {
+  function applySync(state, partyTags, storageEntries, customShiny = null) {
     const used = new Set();
     const counts = { added: 0, updated: 0, moved: 0, evolved: 0, cleaned: 0 };
     const all = () => [...state.party, ...state.box];
@@ -850,15 +896,18 @@
     // 동기화가 만들어 두고 아무도 손대지 않은 NEW 포켓몬. 진짜 개체보다 짝짓기 우선순위를 낮춘다.
     const placeholders = new Set(all().filter((m) => m.isNew && isUntouched(m)).map((m) => m.id));
 
-    // 단계별로 짝을 찾는다.
-    //  1) 같은 종 (NEW 빈 껍데기 제외)  2) 진화 (같은 목록 안에서만)  3) 같은 종 (NEW 빈 껍데기 포함)
+    // 단계별로 짝을 찾는다. (단계 목록은 아래 STAGES 참고)
     // 진화를 같은 목록으로 제한하는 이유: 박스의 딥상어동이 새로 잡은 한카리아스 태그에 끌려가지 않게.
     // 파티 태그와 보관함을 단계마다 번갈아 처리해서, 보관함에 맡긴 개체가 먼저 제자리를 찾은 뒤에 진화를 판단한다.
     // 각 단계 안에서는 (레벨 차이가 작은 쌍 -> 원래 목록에 있는 쪽) 순서로 욕심껏 짝짓는다.
+    // 1) 같은 종(진짜 개체)  2) 진화(진짜 개체, 같은 목록)  3) 같은 종(NEW 빈 껍데기)  4) 진화(NEW 빈 껍데기, 같은 목록)
+    // NEW 빈 껍데기는 항상 진짜 개체보다 뒤에 짝짓고, 같은 종 짝을 진화보다 먼저 찾는다.
+    // (NEW 리자드가 새로 잡은 리자몽 태그에 진화로 끌려가는 문제 방지)
     const STAGES = [
       { test: sameSpecies, evolved: false, allow: () => (m) => !placeholders.has(m.id) },
-      { test: evolvesInto, evolved: true, allow: (homeList) => (m) => listOf(m) === homeList },
-      { test: sameSpecies, evolved: false, allow: () => () => true },
+      { test: evolvesInto, evolved: true, allow: (homeList) => (m) => !placeholders.has(m.id) && listOf(m) === homeList },
+      { test: sameSpecies, evolved: false, allow: () => (m) => placeholders.has(m.id) },
+      { test: evolvesInto, evolved: true, allow: (homeList) => (m) => placeholders.has(m.id) && listOf(m) === homeList },
     ];
 
     const matchStage = (entries, homeList, stage, matched) => {
@@ -950,13 +999,14 @@
       });
     }
 
+    counts.shiny = applyCustomShiny(state, customShiny);
     fillMissingAbilities(state);
     return counts;
   }
 
   function syncFromChat(state, chat, tagsOverride) {
     const tags = tagsOverride ?? latestOwnTags(chat);
-    return applySync(state, tags, parseBotStorage(chat));
+    return applySync(state, tags, parseBotStorage(chat), parseCustomShiny(chat));
   }
 
   // ---------- 프롬프트 주입 ----------
@@ -1966,14 +2016,15 @@
     toast(settings.inject ? '다음 응답부터 봇에게 보유 포켓몬 정보를 알려 줘요.' : '봇에게 알려 주기를 껐어요.');
   }
 
-  function syncResultMessage({ added, updated, moved, evolved = 0, cleaned = 0 }) {
-    if (!added && !updated && !moved && !evolved && !cleaned) return '바뀐 내용이 없어요.';
+  function syncResultMessage({ added, updated, moved, evolved = 0, cleaned = 0, shiny = 0 }) {
+    if (!added && !updated && !moved && !evolved && !cleaned && !shiny) return '바뀐 내용이 없어요.';
     return [
       evolved ? `${evolved}마리 진화` : '',
       added ? `${added}마리 추가` : '',
       updated ? `${updated}마리 갱신` : '',
       moved ? `${moved}마리 자리 이동` : '',
       cleaned ? `중복 ${cleaned}마리 정리` : '',
+      shiny ? `${shiny}마리 이로치 반영` : '',
     ].filter(Boolean).join(', ') + '했어요.';
   }
 
@@ -1983,13 +2034,14 @@
     if (!info) { if (!silent) toast('먼저 채팅을 열어 주세요.'); return; }
     const tags = latestOwnTags(info.chat);
     const storage = parseBotStorage(info.chat);
+    const customShiny = parseCustomShiny(info.chat);
     if (!tags.length && !storage.length) {
       if (!silent) toast('파티 태그도 보관함 기록도 아직 없어요.');
       return;
     }
     ui.storageKey = info.key;
-    const result = await mutateCurrent((state) => applySync(state, tags, storage));
-    if (!silent || result.added || result.moved || result.evolved || result.cleaned) toast(syncResultMessage(result));
+    const result = await mutateCurrent((state) => applySync(state, tags, storage, customShiny));
+    if (!silent || result.added || result.moved || result.evolved || result.cleaned || result.shiny) toast(syncResultMessage(result));
     else render();
   }
 
@@ -2174,15 +2226,16 @@
     const message = chat?.message?.[messageIndex];
     const tags = parseOwnTags(message?.data);
     const storage = parseBotStorage(chat);
+    const customShiny = parseCustomShiny(chat);
     if (!tags.length && !storage.length) return;
     const key = keyForChat(chat, characterIndex, chatIndex);
     (async () => {
       try {
-        const { state, result } = await mutateState(key, (s) => applySync(s, tags, storage));
+        const { state, result } = await mutateState(key, (s) => applySync(s, tags, storage, customShiny));
         // 패널이 같은 채팅을 보고 있으면 화면도 새로고침 (편집 중엔 입력 보호를 위해 건드리지 않음)
         if (ui.open && ui.storageKey === key && ui.view !== 'edit') {
           ui.state = state;
-          if (result.added || result.moved || result.evolved || result.cleaned) toast(syncResultMessage(result)); else render();
+          if (result.added || result.moved || result.evolved || result.cleaned || result.shiny) toast(syncResultMessage(result)); else render();
         }
       } catch (err) {
         console.log(`[pokedex] 자동 동기화 실패: ${err.message}`);

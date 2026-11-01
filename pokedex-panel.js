@@ -1,6 +1,6 @@
 //@name pokedex_party_panel
 //@api 3.0
-//@version 1.1.5
+//@version 1.1.6
 //@display-name 포켓몬 파티 패널
 //@update-url https://raw.githubusercontent.com/sat7312/pokedex-party-panel/main/pokedex-panel.js
 //@link https://github.com/sat7312/pokedex-party-panel 사용 설명서
@@ -2239,9 +2239,8 @@
     const cleanupDrag = async (current) => {
       if (drag === current) drag = null;
       // 리스너 등록이 아직 끝나지 않았을 수도 있어서 id가 있을 때만 해제
+      current.ended = true;
       if (current.moveId) await rootDoc.removeEventListener('pointermove', current.moveId);
-      if (current.upId) await rootDoc.removeEventListener('pointerup', current.upId);
-      if (current.cancelId) await rootDoc.removeEventListener('pointercancel', current.cancelId);
       await fab.setStyle('cursor', 'grab');
       await fab.setStyle('transform', '');
     };
@@ -2250,7 +2249,7 @@
       const current = drag;
       if (!current) return;
       await cleanupDrag(current);
-      if (!current.moved) return;   // 클릭 처리는 click 이벤트에서
+      if (!current.moved || !current.ready) return;   // 클릭 처리는 click 이벤트에서
       justDragged = true;
 
       // 놓은 위치를 화면 비율로 저장
@@ -2275,22 +2274,31 @@
       await openPanel();
     });
 
+    // 손을 떼는 신호는 드래그마다 새로 등록하지 않고 처음부터 걸어 둔다.
+    // (드래그 시작 직후 리스너가 등록되기 전에 손을 떼면 신호를 놓쳐서 볼이 마우스를 계속 따라오던 문제)
+    await rootDoc.addEventListener('pointerup', (e) => { if (drag) finishDrag(e); });
+    await rootDoc.addEventListener('pointercancel', (e) => { if (drag) finishDrag(e); });
+
     await fab.addEventListener('pointerdown', async (event) => {
-      if (drag || event.button > 0) return;   // 왼쪽 버튼/터치만
-      const rect = await fab.getBoundingClientRect();
-      const vw = await rootDoc.clientWidth();
-      const vh = await rootDoc.clientHeight();
-      drag = {
+      if (event.button > 0) return;   // 왼쪽 버튼/터치만
+      if (drag) await cleanupDrag(drag);   // 끝나지 않은 이전 드래그가 남아 있으면 정리
+
+      // 드래그 상태는 기다리는 작업보다 먼저 만든다
+      const state = {
         startX: event.clientX, startY: event.clientY,
-        originLeft: rect.left, originTop: rect.top,
-        maxLeft: vw - FAB_SIZE - FAB_MARGIN, maxTop: vh - FAB_SIZE - FAB_MARGIN,
-        moved: false,
+        lastX: event.clientX, lastY: event.clientY,
+        originLeft: 0, originTop: 0, maxLeft: 0, maxTop: 0,
+        moved: false, ready: false, ended: false,
       };
-      const state = drag;
-      await fab.setStyle('cursor', 'grabbing');
+      drag = state;
 
       state.moveId = await rootDoc.addEventListener('pointermove', async (e) => {
-        if (drag !== state) return;
+        if (drag !== state || state.ended) return;
+        // 버튼이 눌려 있지 않은데 움직이면 손을 뗀 신호를 놓친 것: 여기서 드래그를 끝낸다
+        if (e.buttons === 0) { finishDrag({ clientX: state.lastX, clientY: state.lastY }); return; }
+        state.lastX = e.clientX;
+        state.lastY = e.clientY;
+        if (!state.ready) return;
         const dx = e.clientX - state.startX;
         const dy = e.clientY - state.startY;
         if (!state.moved && Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
@@ -2305,8 +2313,20 @@
         await fab.setStyle('left', `${left}px`);
         await fab.setStyle('top', `${top}px`);
       });
-      state.upId = await rootDoc.addEventListener('pointerup', finishDrag);
-      state.cancelId = await rootDoc.addEventListener('pointercancel', finishDrag);
+      if (state.ended) {   // 등록하는 사이에 이미 손을 뗀 경우
+        await rootDoc.removeEventListener('pointermove', state.moveId);
+        return;
+      }
+
+      const rect = await fab.getBoundingClientRect();
+      const vw = await rootDoc.clientWidth();
+      const vh = await rootDoc.clientHeight();
+      Object.assign(state, {
+        originLeft: rect.left, originTop: rect.top,
+        maxLeft: vw - FAB_SIZE - FAB_MARGIN, maxTop: vh - FAB_SIZE - FAB_MARGIN,
+        ready: true,
+      });
+      if (!state.ended) await fab.setStyle('cursor', 'grabbing');
     });
 
     risuai.onUnload?.(async () => {

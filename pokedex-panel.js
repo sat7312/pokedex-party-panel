@@ -1,6 +1,6 @@
 //@name pokedex_party_panel
 //@api 3.0
-//@version 1.1.3
+//@version 1.1.4
 //@display-name 포켓몬 파티 패널
 //@update-url https://raw.githubusercontent.com/sat7312/pokedex-party-panel/main/pokedex-panel.js
 //@link https://github.com/sat7312/pokedex-party-panel 사용 설명서
@@ -629,7 +629,16 @@
         gender: normalizeGender(f['gender'] ?? f['sex'] ?? f['성별'] ?? ''),
       });
     }
-    return tags.sort((a, b) => a.slot - b.slot);
+    // 번역 플러그인이 원문 아래에 번역문을 덧붙이면 같은 태그 목록이 두 번 나온다.
+    // 같은 슬롯 번호는 처음 나온 것(보통 원문)만 쓴다.
+    const seen = new Set();
+    const unique = tags.filter((t) => {
+      if (!Number.isFinite(t.slot)) return true;
+      if (seen.has(t.slot)) return false;
+      seen.add(t.slot);
+      return true;
+    });
+    return unique.sort((a, b) => a.slot - b.slot);
   }
 
   function speciesKey(englishName) {
@@ -694,6 +703,16 @@
   // - 기술, 도구, 메모는 건드리지 않는다.
   // - 진화(티고라스 -> 견고라스)는 같은 개체로 보고 이름/영문명/레벨만 바꾼다.
   // - 사용자가 만든 데이터는 지우지 않는다. 지우는 건 동기화가 잘못 만들어 둔 손대지 않은 NEW 중복뿐이다.
+  // 원문이 영어인 경우(번역 플러그인 사용 등) 태그 이름이 "Garchomp"처럼 영어로 온다.
+  // 그럴 땐 도감의 한국어 이름을 쓴다. 한글이 섞인 이름(별명 포함)은 그대로 쓴다.
+  function koreanDisplayName(entry) {
+    const raw = String(entry?.name ?? '').trim();
+    if (raw && /[가-힣]/.test(raw)) return raw;
+    const species = lookupSpecies({ name: raw, englishName: entry?.englishName || raw });
+    if (species?.nameKo) return species.nameKo;
+    return raw || entry?.englishName || '';
+  }
+
   function applySync(state, partyTags, storageEntries) {
     const used = new Set();
     const counts = { added: 0, updated: 0, moved: 0, evolved: 0, cleaned: 0 };
@@ -734,7 +753,7 @@
       if (evolved) {
         const before = speciesOf(mon);
         const oldForm = mon.form;
-        mon.name = entry.name || mon.name;
+        mon.name = koreanDisplayName(entry) || mon.name;
         mon.englishName = entry.englishName || '';
         mon.form = '';
         if (oldForm) mon.form = evolvedForm(oldForm, speciesOf(mon));
@@ -744,12 +763,13 @@
       } else {
         // 이름의 폼 힌트("나인테일(알로라)")가 태그 이름으로 덮여 사라지기 전에 모습을 고정해 둔다.
         // 메가진화/거다이맥스는 배틀 중에만 바뀌는 모습이라 고정하지 않는다.
-        if (!mon.form && entry.name && mon.name !== entry.name) {
+        const nextName = koreanDisplayName(entry);
+        if (!mon.form && nextName && mon.name !== nextName) {
           const prev = speciesOf(mon);
           const sprite = DEX_DATA.f[prev?.formKey]?.[0] ?? '';
           if (prev?.formKey && !/-(mega|gmax)/.test(sprite) && !speciesOf(entry)?.formKey) mon.form = prev.formKey;
         }
-        if (entry.name && mon.name !== entry.name) { mon.name = entry.name; changed = true; }
+        if (nextName && mon.name !== nextName) { mon.name = nextName; changed = true; }
         if (entry.englishName && !mon.englishName) { mon.englishName = entry.englishName; changed = true; }
       }
       // 봇이 성별을 알려 주면 그 값을 따른다
@@ -812,7 +832,7 @@
 
     const addNew = (entry, target) => {
       const fresh = emptyMon();
-      fresh.name = entry.name || entry.englishName;
+      fresh.name = koreanDisplayName(entry);
       fresh.englishName = entry.englishName;
       fresh.level = Number.isFinite(entry.level) ? String(entry.level) : '';
       fresh.gender = entry.gender || '';

@@ -1,6 +1,6 @@
 //@name pokedex_party_panel
 //@api 3.0
-//@version 1.1.6
+//@version 1.2.0
 //@display-name 포켓몬 파티 패널
 //@update-url https://raw.githubusercontent.com/sat7312/pokedex-party-panel/main/pokedex-panel.js
 //@link https://github.com/sat7312/pokedex-party-panel 사용 설명서
@@ -36,10 +36,35 @@
   const BOT_STORAGE_VAR = '$yp_PokemonStorage';   // 채팅 변수는 scriptstate에 '$' 접두사로 저장됨
   const HISTORY_CHAR_LIMIT = 40000;               // 보조모델에 보낼 채팅 기록 최대 길이 (최근 것부터)
   const PARTY_LIMIT = 6;
-  const DEX_SPRITE_URL = (dex) =>
-    `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/${dex}.png`;
-  const SHOWDOWN_SPRITE_URL = (name) =>
-    `https://play.pokemonshowdown.com/sprites/gen5/${name}.png`;
+  const DEX_SPRITE_URL = (dex, shiny = false) =>
+    `https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/${shiny ? 'shiny/' : ''}${dex}.png`;
+  const SHOWDOWN_SPRITE_URL = (name, shiny = false) =>
+    `https://play.pokemonshowdown.com/sprites/${shiny ? 'gen5-shiny' : 'gen5'}/${name}.png`;
+
+  // ---------- 이로치 ----------
+  // 이름에 붙은 이로치 표시: "이로치 한카리아스", "한카리아스(이로치)", "Shiny Garchomp", "✨한카리아스"
+  const SHINY_WORD_RE = /이로치|색이\s*다른|\bshiny\b|✨|★/gi;
+
+  function hasShinyMark(text) {
+    SHINY_WORD_RE.lastIndex = 0;
+    return SHINY_WORD_RE.test(String(text ?? ''));
+  }
+
+  function stripShinyMark(text) {
+    return String(text ?? '')
+      .replace(SHINY_WORD_RE, '')
+      .replace(/\(\s*\)|\[\s*\]/g, '')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+  }
+
+  function parseShinyValue(value) {
+    const v = String(value ?? '').trim().toLowerCase();
+    if (!v) return null;
+    if (/^(yes|y|true|1|o|on|✨|★|이로치|예|네|맞음)$/.test(v)) return true;
+    if (/^(no|n|false|0|x|off|-|아니오|아니요|일반)$/.test(v)) return false;
+    return null;
+  }
 
   // 봇의 getPokemonShowdownSpriteName()과 같은 규칙: Nidoran♀ -> nidoranf, Mr. Mime -> mrmime
   function showdownName(englishName) {
@@ -262,7 +287,11 @@
     return DEX_DATA.m[key]?.[1] === dex ? key : null;
   }
 
-  function lookupSpecies(mon) {
+  function lookupSpecies(rawMon) {
+    // 이로치 표시는 종 찾기에 방해되므로 떼고 찾는다
+    const mon = rawMon && (hasShinyMark(rawMon.name) || hasShinyMark(rawMon.englishName))
+      ? { ...rawMon, name: stripShinyMark(rawMon.name), englishName: stripShinyMark(rawMon.englishName) }
+      : rawMon;
     // 1) 직접 고른 모습이 가장 우선
     if (mon?.form) {
       const picked = buildSpecies(mon.form);
@@ -511,6 +540,7 @@
       name: '', englishName: '', level: '', dex: '', image: '',
       form: '',   // 직접 고른 모습(폼) 키. 예: ninetalesalola. 비어 있으면 이름/영문명으로 판단
       isNew: false,
+      shiny: false,        // 이로치
       gender: '',          // '♂' | '♀' | 'none'(무성) | ''(미정)
       genderAuto: false,   // 성비에 따라 무작위로 정한 값이면 true
       types: ['', ''],
@@ -650,6 +680,8 @@
         level: parseInt(f['level'] ?? f['lv'] ?? f['레벨'] ?? '', 10),
         englishName,
         gender: normalizeGender(f['gender'] ?? f['sex'] ?? f['성별'] ?? ''),
+        // 이로치: 개조판 등이 Shiny 칸을 주거나, 이름에 이로치 표시가 붙은 경우
+        shiny: parseShinyValue(f['shiny'] ?? f['이로치'] ?? '') ?? (hasShinyMark(name) || hasShinyMark(englishName) || null),
       });
     }
     // 번역 플러그인이 원문 아래에 번역문을 덧붙이면 같은 태그 목록이 두 번 나온다.
@@ -677,7 +709,9 @@
       // 개조판이 4번째 칸에 성별을 넣는 경우도 읽는다
       const [name, level, englishName, gender] = part.split('^').map((v) => (v ?? '').trim());
       const lv = parseInt(level, 10);
-      if (name && englishName && Number.isFinite(lv)) entries.push({ name, level: lv, englishName, gender: normalizeGender(gender) });
+      if (name && englishName && Number.isFinite(lv)) {
+        entries.push({ name, level: lv, englishName, gender: normalizeGender(gender), shiny: hasShinyMark(name) || hasShinyMark(englishName) || null });
+      }
     }
     return entries;
   }
@@ -729,9 +763,9 @@
   // 원문이 영어인 경우(번역 플러그인 사용 등) 태그 이름이 "Garchomp"처럼 영어로 온다.
   // 그럴 땐 도감의 한국어 이름을 쓴다. 한글이 섞인 이름(별명 포함)은 그대로 쓴다.
   function koreanDisplayName(entry) {
-    const raw = String(entry?.name ?? '').trim();
+    const raw = stripShinyMark(entry?.name);
     if (raw && /[가-힣]/.test(raw)) return raw;
-    const species = lookupSpecies({ name: raw, englishName: entry?.englishName || raw });
+    const species = lookupSpecies({ name: raw, englishName: stripShinyMark(entry?.englishName) || raw });
     if (species?.nameKo) return species.nameKo;
     return raw || entry?.englishName || '';
   }
@@ -797,6 +831,8 @@
         if (entry.englishName && !mon.englishName) { mon.englishName = entry.englishName; changed = true; }
       }
       // 봇이 성별을 알려 주면 그 값을 따른다
+      if (entry.shiny === true && !mon.shiny) { mon.shiny = true; changed = true; }
+      if (entry.shiny === false && mon.shiny && entry.shinyExplicit) { mon.shiny = false; changed = true; }
       if (entry.gender && (mon.gender !== entry.gender || mon.genderAuto)) {
         mon.gender = entry.gender;
         mon.genderAuto = false;
@@ -860,6 +896,7 @@
       fresh.englishName = entry.englishName;
       fresh.level = Number.isFinite(entry.level) ? String(entry.level) : '';
       fresh.gender = entry.gender || '';
+      fresh.shiny = entry.shiny === true;
       fresh.isNew = true;
       used.add(fresh.id);
       const list = target === 'party' && makeRoomInParty() ? 'party' : 'box';
@@ -926,7 +963,8 @@
 
   function describeMon(mon) {
     const formName = lookupSpecies(mon)?.formLabel;
-    const genderMark = (mon.gender === '♂' || mon.gender === '♀') && !/[♂♀]$/.test(mon.name) ? mon.gender : '';
+    const genderMark = ((mon.gender === '♂' || mon.gender === '♀') && !/[♂♀]$/.test(mon.name) ? mon.gender : '')
+      + (mon.shiny && !hasShinyMark(mon.name) ? ' (이로치)' : '');
     const head = `${mon.name}${genderMark}${formName && !mon.name.includes(formName) ? `(${formName})` : ''}${mon.level ? ` Lv.${mon.level}` : ''}`;
     const types = monTypes(mon).filter(Boolean).join('/');
     const parts = [types ? `${head} (${types})` : head];
@@ -1186,10 +1224,10 @@
     if (mon.image) return mon.image;
     // 도감에서 찾은 종 키를 먼저 쓴다 ("Alolan Ninetales" -> ninetalesalola 처럼 표기 차이를 흡수)
     const species = lookupSpecies(mon);
-    if (species) return SHOWDOWN_SPRITE_URL(species.spriteName);
-    const sd = showdownName(mon.englishName);
-    if (sd) return SHOWDOWN_SPRITE_URL(sd);
-    if (mon.dex) return DEX_SPRITE_URL(Number(mon.dex));
+    if (species) return SHOWDOWN_SPRITE_URL(species.spriteName, mon.shiny);
+    const sd = showdownName(stripShinyMark(mon.englishName));
+    if (sd) return SHOWDOWN_SPRITE_URL(sd, mon.shiny);
+    if (mon.dex) return DEX_SPRITE_URL(Number(mon.dex), mon.shiny);
     return '';
   }
 
@@ -1197,7 +1235,7 @@
   function spriteAlt(mon) {
     if (mon.image) return '';
     const species = lookupSpecies(mon);
-    return species ? DEX_SPRITE_URL(species.pokeId) : '';
+    return species ? DEX_SPRITE_URL(species.pokeId, mon.shiny) : '';
   }
 
   function sprite(mon, cls) {
@@ -1292,6 +1330,7 @@
     .switch.on i { background:var(--accent2); }
     .switch.on i::after { transform:translateX(16px); }
     .switch.on { color:var(--ink); }
+    .card.is-shiny { border-color:#e8b04a; background:linear-gradient(180deg,#fffaf0,#fff3dc); box-shadow:0 4px 0 #c08a2a; }
     .card.add { display:flex; flex-direction:column; align-items:center; justify-content:center;
       border-style:dashed; box-shadow:none; color:var(--sub); font-weight:700; min-height:160px; background:#fafcff; }
     .card.add b { font-size:30px; line-height:1; }
@@ -1388,6 +1427,7 @@
     .chip[data-act]:hover { background:#e6eef6; }
     .auto { font-size:10px; font-weight:800; color:#fff; background:#8aa0b3; padding:1px 6px; border-radius:999px; vertical-align:middle; }
     .gd { font-weight:900; margin-left:3px; }
+    .shiny { color:#f5a524; font-weight:900; margin-right:3px; text-shadow:0 0 6px rgba(245,165,36,.55); }
     .gd.m { color:#3b82f6; }
     .gd.f { color:#e8508f; }
     .formlbl { font-size:13px; font-weight:700; color:var(--sub); margin-left:8px; }
@@ -1411,11 +1451,11 @@
   function renderList() {
     const list = ui.state[ui.tab];
     const cards = list.map((mon) => `
-      <div class="card" data-act="open" data-id="${esc(mon.id)}">
+      <div class="card${mon.shiny ? ' is-shiny' : ''}" data-act="open" data-id="${esc(mon.id)}">
         ${mon.level ? `<span class="lv">Lv.${esc(mon.level)}</span>` : ''}
         ${mon.isNew ? '<span class="new">NEW</span>' : ''}
         ${sprite(mon, 'spr')}
-        <div class="name">${esc(mon.name || '(이름 없음)')}${/[♂♀]$/.test(mon.name) ? '' : genderSymbol(mon.gender)}</div>
+        <div class="name">${mon.shiny ? '<span class="shiny" title="이로치">✦</span>' : ''}${esc(mon.name || '(이름 없음)')}${/[♂♀]$/.test(mon.name) ? '' : genderSymbol(mon.gender)}</div>
         <div class="types">${monTypes(mon).map((t) => typeBadge(t, true)).join('')}</div>
       </div>`).join('');
 
@@ -1558,10 +1598,11 @@
       <div class="detail-top">
         ${sprite(mon, 'spr')}
         <div>
-          <h2>${esc(mon.name || '(이름 없음)')}${/[♂♀]$/.test(mon.name) ? '' : genderSymbol(mon.gender)}${species?.formLabel && !mon.name.includes(species.formLabel) ? `<span class="formlbl">${esc(species.formLabel)}</span>` : ''}</h2>
+          <h2>${mon.shiny ? '<span class="shiny" title="이로치">✦</span>' : ''}${esc(mon.name || '(이름 없음)')}${/[♂♀]$/.test(mon.name) ? '' : genderSymbol(mon.gender)}${species?.formLabel && !mon.name.includes(species.formLabel) ? `<span class="formlbl">${esc(species.formLabel)}</span>` : ''}</h2>
           <div class="types">${monTypes(mon).map((t) => typeBadge(t)).join(' ')}</div>
           <dl class="meta">
             <dt>레벨</dt><dd>${esc(mon.level || '-')}</dd>
+            ${mon.shiny ? '<dt>색</dt><dd><span class="shiny">✦</span> 이로치</dd>' : ''}
             <dt>성별</dt><dd>${mon.gender === '♂' ? '수컷 ♂' : mon.gender === '♀' ? '암컷 ♀' : mon.gender === 'none' ? '성별 없음' : '-'}${mon.genderAuto ? ' <span class="auto" title="성비에 맞춰 무작위로 정해졌어요. 편집에서 바꿀 수 있어요.">자동</span>' : ''}</dd>
             <dt>특성</dt><dd>${esc(mon.ability || '-')}${mon.abilityAuto ? ' <span class="auto" title="일반 특성 중 무작위로 정해졌어요. 기록에서 찾기나 편집으로 바꿀 수 있어요.">자동</span>' : ''}</dd>
             <dt>도구</dt><dd>${esc(mon.item || '-')}</dd>
@@ -1671,6 +1712,11 @@
         ${renderFormSelect(d, species)}
         ${speciesBlock}
         ${renderGenderSelect(d, species)}
+        <div class="row"><div><label>색</label>
+          <select data-f="shiny" data-rerender="1">
+            <option value="false" ${d.shiny ? '' : 'selected'}>일반</option>
+            <option value="true" ${d.shiny ? 'selected' : ''}>✦ 이로치</option>
+          </select></div></div>
         <div class="row r2">
           <div><label>특성</label><input data-f="ability" value="${esc(d.ability)}" list="ability-hints"><datalist id="ability-hints">${abilityList}</datalist></div>
           <div><label>지닌 도구</label><input data-f="item" value="${esc(d.item)}"></div>
@@ -1739,7 +1785,7 @@
     const el = event.target;
     const path = el?.dataset?.f;
     if (!path || !ui.draft) return;
-    setByPath(ui.draft, path, String(el.value));
+    setByPath(ui.draft, path, path === 'shiny' ? el.value === 'true' : String(el.value));
   }
 
   // ---------- 동작 ----------

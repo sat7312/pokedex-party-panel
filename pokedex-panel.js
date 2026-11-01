@@ -578,7 +578,7 @@
     if (charIndex == null || charIndex < 0) return null;
     const chatIndex = await risuai.getCurrentChatIndex();
     const chat = await risuai.getChatFromIndex(charIndex, chatIndex);
-    return { chat, key: keyForChat(chat, charIndex, chatIndex) };
+    return { chat, charIndex, chatIndex, key: keyForChat(chat, charIndex, chatIndex) };
   }
 
   async function loadState(key) {
@@ -591,6 +591,9 @@
         party: (parsed.party ?? []).map(normalizeMon),
         box: (parsed.box ?? []).map(normalizeMon),
         customShiny: parsed.customShiny ?? null,
+        tagSig: parsed.tagSig ?? '',                 // 마지막으로 동기화한 파티 태그 목록의 서명
+        manualOrder: parsed.manualOrder ?? null,     // { sig } 이 태그 목록에서는 사용자가 정한 파티 순서를 유지
+        statusBackup: parsed.statusBackup ?? null,   // 상태창을 고치기 전 원문 (되돌리기 1회분)
       };
     } catch (err) {
       console.log(`[pokedex] 저장 데이터를 읽지 못함: ${err.message}`);
@@ -621,7 +624,8 @@
   }
 
   // fabPos: 몬스터볼 버튼 위치 (화면 크기 대비 비율 0~1, null이면 기본 위치)
-  let settings = { autoSync: true, inject: true, fabPos: null };
+  // editStatus: 파티 순서를 바꾸면 마지막 AI 응답의 상태창(Own Pokémon 줄)도 같은 순서로 고친다
+  let settings = { autoSync: true, inject: true, editStatus: true, fabPos: null };
 
   async function loadSettings() {
     try {
@@ -681,6 +685,7 @@
         level: parseInt(f['level'] ?? f['lv'] ?? f['레벨'] ?? '', 10),
         englishName,
         gender: normalizeGender(f['gender'] ?? f['sex'] ?? f['성별'] ?? ''),
+        where: f['state'] ?? f['상태'] ?? '',   // 배틀 / 필드 / 볼
         // 이로치: 개조판 등이 Shiny 칸을 주거나, 이름에 이로치 표시가 붙은 경우
         shiny: parseShinyValue(f['shiny'] ?? f['이로치'] ?? '') ?? (hasShinyMark(name) || hasShinyMark(englishName) || null),
       });
@@ -818,7 +823,7 @@
 
   function applySync(state, partyTags, storageEntries, customShiny = null) {
     const used = new Set();
-    const counts = { added: 0, updated: 0, moved: 0, evolved: 0, cleaned: 0 };
+    const counts = { added: 0, updated: 0, moved: 0, evolved: 0, cleaned: 0, reordered: 0 };
     const all = () => [...state.party, ...state.box];
     const listOf = (mon) => (state.party.includes(mon) ? 'party' : 'box');
     const speciesOf = (x) => lookupSpecies(x);
@@ -951,6 +956,7 @@
       const list = target === 'party' && makeRoomInParty() ? 'party' : 'box';
       state[list].push(fresh);
       counts.added += 1;
+      return fresh;
     };
 
     const validEntries = (list) => (list ?? []).filter((e) => e.name || e.englishName);
@@ -978,7 +984,7 @@
     // 2) 파티 태그 (보관함으로 내려갈 포켓몬이 자리를 비운 뒤에 올린다)
     for (const entry of tags) {
       const mon = partyMatched.get(entry);
-      if (!mon) { addNew(entry, 'party'); continue; }
+      if (!mon) { partyMatched.set(entry, addNew(entry, 'party')); continue; }
       if (listOf(mon) === 'box' && makeRoomInParty()) {
         state.box.splice(state.box.indexOf(mon), 1);
         state.party.push(mon);
@@ -999,6 +1005,39 @@
       });
     }
 
+    // 4) 파티 태그 줄과 패널 포켓몬을 연결하고, 파티 순서를 태그 순서에 맞춘다.
+    //    연결 정보(lastTag)는 순서를 바꿀 때 상태창의 어느 줄이 어느 포켓몬인지 찾는 데 쓴다.
+    //    태그에 없는 파티 포켓몬은 원래 순서를 지켜 뒤에 둔다.
+    //    사용자가 패널에서 순서를 바꾼 뒤(manualOrder)에는 다음 태그 목록이 올 때까지 순서를 건드리지 않는다.
+    if (tags.length) {
+      const linked = new Map();   // mon -> entry (태그 순서)
+      for (const entry of tags) {
+        const mon = partyMatched.get(entry);
+        if (mon && state.party.includes(mon) && Number.isFinite(entry.slot) && !linked.has(mon)) linked.set(mon, entry);
+      }
+      for (const mon of all()) {
+        const entry = linked.get(mon);
+        if (entry) {
+          mon.lastTag = {
+            slot: entry.slot, name: entry.name,
+            level: Number.isFinite(entry.level) ? entry.level : null, gender: entry.gender || '',
+          };
+        } else {
+          delete mon.lastTag;
+        }
+      }
+      const sig = tagSignature(tags);
+      state.tagSig = sig;
+      if (state.manualOrder && state.manualOrder.sig !== sig) state.manualOrder = null;
+      if (!state.manualOrder) {
+        const next = [...linked.keys(), ...state.party.filter((m) => !linked.has(m))];
+        if (next.some((m, i) => m !== state.party[i])) {
+          state.party = next;
+          counts.reordered = 1;
+        }
+      }
+    }
+
     counts.shiny = applyCustomShiny(state, customShiny);
     fillMissingAbilities(state);
     return counts;
@@ -1007,6 +1046,73 @@
   function syncFromChat(state, chat, tagsOverride) {
     const tags = tagsOverride ?? latestOwnTags(chat);
     return applySync(state, tags, parseBotStorage(chat), parseCustomShiny(chat));
+  }
+
+  // ---------- 상태창 순서 고치기 (텍스트) ----------
+
+  // 태그 목록 서명. 패널이 기억하는 연결 정보가 지금 메시지와 같은 태그에서 나왔는지 확인할 때 쓴다.
+  function tagSignature(tags) {
+    return (tags ?? [])
+      .map((t) => `${t.slot}:${t.name}:${Number.isFinite(t.level) ? t.level : ''}:${t.gender || ''}`)
+      .join('|');
+  }
+
+  function isBattleState(value) {
+    return /배틀|전투|battle/i.test(String(value ?? ''));
+  }
+
+  // 메시지 속 [Own Pokémon N ...] 태그를 위치와 함께 찾는다.
+  // 번역 플러그인이 같은 목록을 한 번 더 붙이면 슬롯 번호가 다시 나오므로, 그때부터 새 묶음으로 나눈다.
+  function ownTagGroups(text) {
+    const groups = [];
+    let current = null;
+    for (const m of String(text ?? '').matchAll(OWN_TAG_RE)) {
+      const slot = Number(m[1]);
+      if (!current || current.some((t) => t.slot === slot)) { current = []; groups.push(current); }
+      current.push({ slot, start: m.index, end: m.index + m[0].length, raw: m[0] });
+    }
+    return groups;
+  }
+
+  // 패널 파티 순서대로 상태창 태그 줄을 다시 배치한 텍스트를 만든다.
+  // 바꾸는 것은 Own 태그 줄의 순서와 번호뿐이고, 그 밖의 글자(줄바꿈, 다른 태그 포함)는 그대로 둔다.
+  // 패널과 연결된 줄만 옮기고, 연결되지 않은 줄은 제자리를 지킨다.
+  // 반환: { text, changed } 또는 { error: 'notags' | 'unlinked' | 'mismatch' }
+  function planStatusReorder(text, party) {
+    const groups = ownTagGroups(text);
+    if (!groups.length) return { error: 'notags' };
+    const base = groups[0].map((t) => t.slot);   // 지금 줄 순서 (첫 묶음 = 보통 원문)
+    const baseSet = new Set(base);
+    if (baseSet.size !== base.length) return { error: 'mismatch' };
+    for (const group of groups) {
+      if (group.length !== base.length || group.some((t) => !baseSet.has(t.slot))) return { error: 'mismatch' };
+    }
+    const linkedSet = new Set();
+    const linked = [];
+    for (const mon of party) {
+      const slot = mon.lastTag?.slot;
+      if (!baseSet.has(slot) || linkedSet.has(slot)) continue;
+      linkedSet.add(slot);
+      linked.push(slot);
+    }
+    if (!linked.length) return { error: 'unlinked' };
+    const queue = [...linked];
+    const desired = base.map((slot) => (linkedSet.has(slot) ? queue.shift() : slot));
+    // 번호는 봇이 쓴 번호들을 작은 것부터 위에서 차례로 붙인다 (1,2,4처럼 빠진 번호가 있어도 그대로 유지)
+    const numbers = [...base].sort((a, b) => a - b);
+    // 함수로 치환해야 "$1" 뒤에 숫자가 붙어 "$12"로 읽히는 문제가 없다
+    const renumber = (raw, n) => raw.replace(/^(\[Own Pok[eé]mon )\d+/, (_, head) => head + n);
+    let out = '';
+    let cursor = 0;
+    for (const group of groups) {
+      const bySlot = new Map(group.map((t) => [t.slot, t]));
+      group.forEach((t, k) => {
+        out += text.slice(cursor, t.start) + renumber(bySlot.get(desired[k]).raw, numbers[k]);
+        cursor = t.end;
+      });
+    }
+    out += text.slice(cursor);
+    return { text: out, changed: out !== text };
   }
 
   // ---------- 프롬프트 주입 ----------
@@ -1030,7 +1136,7 @@
     if (!state.party.length && !state.box.length) return '';
     const lines = ['[보유 포켓몬 정보]'];
     if (state.party.length) {
-      lines.push('파티:');
+      lines.push('파티 (순서대로):');
       for (const mon of state.party) lines.push(`- ${describeMon(mon)}`);
     }
     if (state.box.length) {
@@ -1316,7 +1422,12 @@
     learnOpen: true,        // 상세 화면의 '배울 수 있는 기술' 펼침 상태
     fab: null,
     moveHints: '',
+    ordering: null,         // 순서 편집 중이면 { list: 'party' | 'box', ids: [포켓몬 id 순서] }
+    confirm: null,          // 확인 창 { text, yes, no, resolve }
+    renderPending: false,
   };
+
+  let orderDrag = null;     // 순서 바꾸기에서 카드를 집고 있는 동안의 상태
 
   function findMon(id) {
     for (const list of ['party', 'box']) {
@@ -1485,6 +1596,25 @@
     .hint.warn { color:#a2621b; background:#fff6e8; border-radius:8px; padding:8px 10px; margin:0 0 10px; }
     .busy { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
       background:rgba(255,255,255,.6); font-weight:800; color:var(--ink); z-index:5; }
+    .grid.ordering .card { cursor:grab; padding-top:32px; user-select:none; -webkit-user-select:none;
+      -webkit-touch-callout:none; }
+    .grid.ordering .card:hover { transform:none; }
+    .grid.ordering .card img { -webkit-user-drag:none; pointer-events:none; }
+    .card .handle { position:absolute; top:0; left:0; right:0; height:26px; display:flex; align-items:center;
+      justify-content:center; font-size:16px; letter-spacing:2px; color:var(--sub); background:#e3edf7;
+      border-radius:12px 12px 0 0; touch-action:none; cursor:grab; }
+    .card .ordno { position:absolute; top:32px; left:10px; font-size:12px; font-weight:900; color:#fff;
+      background:var(--accent2); min-width:20px; height:20px; line-height:20px; border-radius:999px; }
+    .card.placeholder { opacity:.35; border-style:dashed; box-shadow:none; }
+    .card.ghost { position:fixed; z-index:20; margin:0; pointer-events:none; opacity:.95;
+      transform:scale(1.05) rotate(-2deg); box-shadow:0 14px 30px rgba(0,0,0,.3); transition:none; }
+    .ordbar b { font-size:14px; }
+    .modal { position:fixed; inset:0; z-index:7; display:flex; align-items:center; justify-content:center;
+      padding:16px; background:rgba(15,25,40,.45); }
+    .dialog { width:100%; max-width:380px; background:#fff; border-radius:14px; padding:16px;
+      box-shadow:0 18px 50px rgba(0,0,0,.25); font-size:14px; line-height:1.55; }
+    .dialog p { margin:0; }
+    .dialog .actions { margin-top:14px; justify-content:flex-end; }
     .toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%); background:var(--ink); color:#fff;
       padding:9px 16px; border-radius:999px; font-size:13px; z-index:6; max-width:90%; }
 
@@ -1498,7 +1628,43 @@
     }
   `;
 
+  function renderOrderList() {
+    const { list } = ui.ordering;
+    const byId = new Map(ui.state[list].map((m) => [m.id, m]));
+    const ids = currentOrderIds();
+    const cards = ids.map((id, i) => {
+      const mon = byId.get(id);
+      return `
+      <div class="card${mon.shiny ? ' is-shiny' : ''}" data-oid="${esc(id)}">
+        <div class="handle" title="끌어서 옮기기" aria-hidden="true">⠿⠿</div>
+        <span class="ordno">${i + 1}</span>
+        ${sprite(mon, 'spr')}
+        <div class="name">${mon.shiny ? '<span class="shiny" title="이로치">✦</span>' : ''}${esc(mon.name || '(이름 없음)')}${/[♂♀]$/.test(mon.name) ? '' : genderSymbol(mon.gender)}</div>
+      </div>`;
+    }).join('');
+    const party = list === 'party';
+    const note = party
+      ? (settings.editStatus
+        ? `완료하거나 패널을 닫으면 마지막 AI 응답의 상태창(Own Pokémon 줄) 순서와 번호도 바꿔요.
+           고친 뒤에는 목록의 '상태창 되돌리기'로 한 번 되돌릴 수 있어요.<br>
+           번역문을 따로 저장하는 번역 플러그인을 쓰면 다시 번역하면서 보조모델 요금이 들 수 있어요.`
+        : '상태창은 그대로 두고 패널 순서만 바꿔요. 다음 응답에서 봇이 다른 순서로 적으면 그 순서를 따라가요.')
+      : '박스 순서는 패널 안에서만 바뀌어요. 봇 보관함 순서는 그대로예요.';
+    return `
+      <div class="syncbar ordbar">
+        <b>${party ? '파티' : '박스'} 순서 바꾸기</b>
+        ${party ? `<button class="switch ${settings.editStatus ? 'on' : ''}" data-act="toggle-edit-status" role="switch" aria-checked="${settings.editStatus}">
+          <i></i><span>상태창에도 반영</span></button>` : ''}
+        <span class="grow"></span>
+        <button class="btn" data-act="order-cancel">취소</button>
+        <button class="btn primary" data-act="order-done">완료</button>
+      </div>
+      <div class="grid ordering">${cards}</div>
+      <div class="hint">카드 위쪽 ⠿ 손잡이를 끌어서 옮겨요. 마우스는 카드 어디를 끌어도 돼요.<br>${note}</div>`;
+  }
+
   function renderList() {
+    if (ui.ordering) return renderOrderList();
     const list = ui.state[ui.tab];
     const cards = list.map((mon) => `
       <div class="card${mon.shiny ? ' is-shiny' : ''}" data-act="open" data-id="${esc(mon.id)}">
@@ -1524,6 +1690,8 @@
           <i></i><span>봇에게 알려 주기</span>
         </button>
         <span class="grow"></span>
+        ${ui.tab === 'party' && ui.state.statusBackup ? '<button class="btn" data-act="status-undo" title="마지막으로 고친 상태창을 원래대로 돌려요">↶ 상태창 되돌리기</button>' : ''}
+        ${list.length >= 2 ? '<button class="btn" data-act="order-start">↕ 순서 바꾸기</button>' : ''}
         <button class="btn" data-act="sync-now">지금 동기화</button>
         ${ui.tab === 'party' && list.length ? '<button class="btn magic" data-act="scan-party">📜 기록에서 찾기</button>' : ''}
       </div>
@@ -1789,12 +1957,16 @@
   }
 
   function render() {
+    // 카드를 집고 있는 동안 다시 그리면 집은 카드가 사라지므로, 놓은 뒤에 그린다
+    // (누르기만 하고 아직 움직이지 않은 상태에서는 막지 않는다. 손 떼는 신호를 놓쳐도 화면이 멈추지 않게)
+    if (orderDrag?.active) { ui.renderPending = true; return; }
+    ui.renderPending = false;
     let body;
     if (ui.view === 'detail') body = renderDetail();
     else if (ui.view === 'edit') body = renderEdit();
     else body = renderList();
 
-    const showTabs = ui.view === 'list';
+    const showTabs = ui.view === 'list' && !ui.ordering;
     document.body.innerHTML = `
       <style>${STYLE}</style>
       <div class="wrap" data-act="backdrop">
@@ -1810,6 +1982,9 @@
           <div class="body">${body}</div>
         </div>
       </div>
+      ${ui.confirm ? `<div class="modal"><div class="dialog" role="alertdialog"><p>${esc(ui.confirm.text)}</p>
+        <div class="actions"><button class="btn" data-act="confirm-no">${esc(ui.confirm.no)}</button>
+        <button class="btn primary" data-act="confirm-yes">${esc(ui.confirm.yes)}</button></div></div></div>` : ''}
       ${ui.busy ? `<div class="busy">${esc(ui.busy)}</div>` : ''}
       ${ui.toast ? `<div class="toast">${esc(ui.toast)}</div>` : ''}`;
   }
@@ -1849,6 +2024,9 @@
       ui.selectedId = null;
       ui.draft = null;
       ui.confirmDelete = false;
+      // 다른 방법(뒤로 가기 등)으로 패널이 닫혀 남아 있던 순서 편집·드래그 상태는 버린다
+      if (orderDrag) endOrderDrag();
+      ui.ordering = null;
       ui.open = true;
       render();
       await risuai.showContainer('fullscreen');
@@ -1865,7 +2043,15 @@
     }
   }
 
-  async function closePanel() {
+  // force: 채팅방을 나가서 닫는 경우. 순서는 저장하되 안내를 보여 주려고 패널을 붙잡지 않는다.
+  async function closePanel({ force = false } = {}) {
+    if (ui.ordering) {
+      if (orderDrag) endOrderDrag();
+      const result = await commitOrder();
+      // 상태창을 못 고쳤으면 이유를 볼 수 있게 패널을 닫지 않는다
+      if (result?.level === 'warn' && !force) { toast(result.message); return; }
+    }
+    if (ui.confirm) answerConfirm(false);
     ui.open = false;
     ui.view = 'list';
     ui.draft = null;
@@ -2016,8 +2202,8 @@
     toast(settings.inject ? '다음 응답부터 봇에게 보유 포켓몬 정보를 알려 줘요.' : '봇에게 알려 주기를 껐어요.');
   }
 
-  function syncResultMessage({ added, updated, moved, evolved = 0, cleaned = 0, shiny = 0 }) {
-    if (!added && !updated && !moved && !evolved && !cleaned && !shiny) return '바뀐 내용이 없어요.';
+  function syncResultMessage({ added, updated, moved, evolved = 0, cleaned = 0, shiny = 0, reordered = 0 }) {
+    if (!added && !updated && !moved && !evolved && !cleaned && !shiny && !reordered) return '바뀐 내용이 없어요.';
     return [
       evolved ? `${evolved}마리 진화` : '',
       added ? `${added}마리 추가` : '',
@@ -2025,6 +2211,7 @@
       moved ? `${moved}마리 자리 이동` : '',
       cleaned ? `중복 ${cleaned}마리 정리` : '',
       shiny ? `${shiny}마리 이로치 반영` : '',
+      reordered ? '파티 순서를 상태창대로 정렬' : '',
     ].filter(Boolean).join(', ') + '했어요.';
   }
 
@@ -2058,6 +2245,223 @@
     const findings = await auxScanHistory(targets, history);
     const filled = await mutateCurrent((state) => mergeHistoryFindings(state, findings));
     toast(filled ? `빈칸 ${filled}개를 채웠어요. 내용을 한 번 확인해 주세요.` : '기록에서 새로 찾은 정보가 없어요.');
+  }
+
+  // ---------- 순서 바꾸기 ----------
+  // 순서 편집 모드에서 드래그로 순서를 정하고, 완료(또는 패널 닫기) 때 한 번만 저장한다.
+  // 파티는 설정이 켜져 있으면 마지막 AI 응답의 상태창 줄 순서도 같이 고친다. 박스는 패널 안에서만 바뀐다.
+
+  function startOrdering() {
+    ui.ordering = { list: ui.tab, ids: ui.state[ui.tab].map((m) => m.id) };
+    render();
+  }
+
+  // 편집 중에 동기화로 포켓몬이 들어오거나 빠져도 목록이 맞게 정리한다
+  function currentOrderIds() {
+    const o = ui.ordering;
+    const list = ui.state[o.list];
+    const present = new Set(list.map((m) => m.id));
+    const ids = o.ids.filter((id) => present.has(id));
+    for (const m of list) if (!ids.includes(m.id)) ids.push(m.id);
+    o.ids = ids;
+    return ids;
+  }
+
+  function cancelOrdering() {
+    ui.ordering = null;
+    render();
+  }
+
+  // 반환: { level: 'ok' | 'info' | 'warn', message }
+  // 저장하는 동안에는 ui.busy로 다른 버튼(닫기, 완료 두 번 누르기 등)을 막는다. 확인 창 버튼만 받는다.
+  async function commitOrder() {
+    if (!ui.ordering) return { level: 'info', message: '' };
+    const { list } = ui.ordering;
+    const ids = currentOrderIds();
+    ui.ordering = null;
+    ui.busy = '순서 저장 중…';
+    render();
+    try {
+      return await commitOrderInner(list, ids);
+    } finally {
+      ui.busy = '';
+      render();
+    }
+  }
+
+  async function commitOrderInner(list, ids) {
+    const changed = await mutateCurrent((state) => {
+      const before = state[list].map((m) => m.id).join();
+      const byId = new Map(state[list].map((m) => [m.id, m]));
+      const ordered = ids.filter((id) => byId.has(id)).map((id) => byId.get(id));
+      state[list] = [...ordered, ...state[list].filter((m) => !ids.includes(m.id))];
+      const moved = before !== state[list].map((m) => m.id).join();
+      // 상태창을 못 고치더라도, 같은 태그 목록이 다시 동기화될 때 순서가 되돌아가지 않게 잠가 둔다
+      if (moved && list === 'party') state.manualOrder = { sig: state.tagSig ?? '' };
+      return moved;
+    });
+    if (list === 'box') return { level: 'ok', message: changed ? '박스 순서를 바꿨어요.' : '순서가 그대로예요.' };
+    if (!settings.editStatus) {
+      return { level: 'ok', message: changed ? '파티 순서를 바꿨어요. 상태창은 그대로 뒀어요.' : '순서가 그대로예요.' };
+    }
+    // 순서를 안 바꿨어도 상태창과 다르면(리롤 등) 다시 맞춘다
+    try {
+      return await applyOrderToStatus();
+    } catch (err) {
+      console.log(`[pokedex] 상태창 수정 실패: ${err.message}`);
+      return { level: 'warn', message: `상태창을 고치지 못했어요: ${err.message}` };
+    }
+  }
+
+  const STABLE_WAIT_MS = 700;
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  async function isGroupChat(charIndex) {
+    try {
+      return (await risuai.getCharacterFromIndex(charIndex))?.type === 'group';
+    } catch {
+      return false;
+    }
+  }
+
+  async function sameChatStillOpen(info) {
+    const now = await getCurrentChatInfo();
+    return Boolean(now) && now.key === info.key && now.charIndex === info.charIndex && now.chatIndex === info.chatIndex;
+  }
+
+  // 응답 생성 중인지 알려 주는 API가 없어서, 잠깐 기다렸다 다시 읽어 마지막 메시지가 그대로인지 본다.
+  // 채팅이 바뀌었는지는 기다리기 전에 확인한다. 다시 읽은 뒤에는 저장까지 다른 확인을 끼우지 않는다
+  // (읽기와 저장 사이가 길수록 그사이 생긴 새 메시지를 덮어쓸 위험이 커진다).
+  async function readStableChat(info) {
+    const first = await risuai.getChatFromIndex(info.charIndex, info.chatIndex);
+    await wait(STABLE_WAIT_MS);
+    if (!(await sameChatStillOpen(info))) return { chat: null, stable: false, moved: true };
+    const chat = await risuai.getChatFromIndex(info.charIndex, info.chatIndex);
+    const a = first?.message ?? [];
+    const b = chat?.message ?? [];
+    const stable = Boolean(chat) && !first?.isStreaming && !chat?.isStreaming && chat.id === first?.id
+      && a.length === b.length && a[a.length - 1]?.data === b[b.length - 1]?.data;
+    return { chat, stable, moved: false };
+  }
+
+  // 마지막 응답이 배틀 중인지: 내 포켓몬 중 State가 배틀이거나, 상대 포켓몬 태그가 있으면 배틀로 본다
+  function isBattleMessage(text, tags) {
+    return tags.some((t) => isBattleState(t.where)) || /\[Opposing Pok[eé]mon/.test(String(text ?? ''));
+  }
+
+  const STATUS_ERRORS = {
+    unlinked: '파티 포켓몬과 상태창 줄을 연결하지 못해서 상태창은 고치지 않았어요. 지금 동기화를 누른 뒤 다시 해 주세요.',
+    mismatch: '상태창 태그 묶음(원문과 번역문 등)이 서로 달라서 상태창은 고치지 않았어요.',
+    notags: '마지막 AI 응답에 파티 태그가 없어서 상태창은 고치지 않았어요.',
+  };
+
+  // 마지막 AI 응답의 [Own Pokémon N] 줄을 패널 파티 순서대로 바꿔 저장한다.
+  // setChatToIndex는 채팅을 통째로 바꾸므로, 저장 직전에 다시 읽은 채팅에서 그 메시지 글자만 바꿔 바로 저장한다.
+  async function applyOrderToStatus() {
+    const info = await getCurrentChatInfo();
+    if (!info || info.key !== ui.storageKey) {
+      return { level: 'warn', message: '패널을 연 채팅과 지금 채팅이 달라서 상태창은 고치지 않았어요.' };
+    }
+    const messages = info.chat?.message ?? [];
+    const index = messages.length - 1;
+    const last = messages[index];
+    if (!last || last.role !== 'char') {
+      return { level: 'info', message: '마지막 메시지가 AI 응답이 아니라서 상태창은 고치지 않았어요.' };
+    }
+    const tags = parseOwnTags(last.data);
+    if (!tags.length) return { level: 'info', message: STATUS_ERRORS.notags };
+    const state = await loadState(info.key);
+    if (tagSignature(tags) !== state.tagSig) {
+      return { level: 'warn', message: '패널이 마지막 응답과 아직 동기화되지 않아서 상태창은 고치지 않았어요. 지금 동기화를 누른 뒤 다시 해 주세요.' };
+    }
+    const plan = planStatusReorder(last.data, state.party);
+    if (plan.error) return { level: 'warn', message: STATUS_ERRORS[plan.error] };
+    if (!plan.changed) return { level: 'ok', message: '파티 순서를 저장했어요. 상태창은 이미 같은 순서예요.' };
+    // 캐릭터 전체를 읽는 무거운 확인이라 다른 확인을 다 통과한 뒤에 한다
+    if (await isGroupChat(info.charIndex)) return { level: 'info', message: '그룹 채팅에서는 상태창을 고치지 않아요.' };
+    if (isBattleMessage(last.data, tags)) {
+      const go = await askConfirm(
+        '배틀 중인 포켓몬이 있어요. 순서를 바꾸면 봇의 배틀 진행이 꼬일 수 있어요. 상태창도 고칠까요?',
+        '상태창도 고치기', '패널 순서만',
+      );
+      if (!go) return { level: 'info', message: '패널 순서만 바꿨어요. 상태창은 그대로 뒀어요.' };
+    }
+
+    ui.busy = '상태창 고치는 중…';
+    render();
+    const { chat, stable, moved } = await readStableChat(info);
+    if (moved) return { level: 'warn', message: '채팅이 바뀌어서 상태창은 고치지 않았어요.' };
+    if (!stable || chat.message.length !== messages.length) {
+      return { level: 'warn', message: '응답을 만드는 중이라 상태창은 고치지 않았어요. 끝난 뒤 순서 바꾸기에서 완료를 다시 눌러 주세요.' };
+    }
+    const target = chat.message[index];
+    if (target?.role !== 'char' || target.data !== last.data) {
+      return { level: 'warn', message: '그사이 메시지가 바뀌어서 상태창은 고치지 않았어요. 다시 해 주세요.' };
+    }
+    // 여기서부터 저장까지 다른 await를 끼우지 않는다
+    target.data = plan.text;
+    await risuai.setChatToIndex(info.charIndex, info.chatIndex, chat);
+
+    const check = await risuai.getChatFromIndex(info.charIndex, info.chatIndex);
+    if (check?.message?.[index]?.data !== plan.text) {
+      return { level: 'warn', message: '상태창을 저장하지 못했어요. 앱을 최신 버전으로 업데이트해 주세요.' };
+    }
+    await mutateCurrent((s) => {
+      s.statusBackup = { chatId: chat.id ?? '', index, before: last.data, after: plan.text, at: Date.now() };
+      // 태그에 없는 포켓몬까지 포함해 사용자가 정한 패널 순서를, 다음 AI 응답이 올 때까지 유지한다
+      s.manualOrder = { sig: tagSignature(parseOwnTags(plan.text)) };
+      // 번호가 바뀌었으니 연결 정보를 새 상태창 기준으로 다시 만든다
+      syncFromChat(s, check, parseOwnTags(plan.text));
+    });
+    return { level: 'ok', message: '파티 순서를 상태창에도 반영했어요.' };
+  }
+
+  // 마지막으로 고친 상태창을 원래 글로 되돌린다 (1회분). 그 뒤로 메시지가 바뀌었으면 되돌리지 않는다.
+  async function undoStatus() {
+    const backup = ui.state.statusBackup;
+    if (!backup) return;
+    const info = await getCurrentChatInfo();
+    if (!info || info.key !== ui.storageKey) { toast('패널을 연 채팅에서만 되돌릴 수 있어요.'); return; }
+    const chat = await risuai.getChatFromIndex(info.charIndex, info.chatIndex);
+    const messages = chat?.message ?? [];
+    const target = messages[backup.index];
+    if (!chat || chat.isStreaming || (backup.chatId && chat.id !== backup.chatId)
+      || backup.index !== messages.length - 1 || target?.data !== backup.after) {
+      await mutateCurrent((s) => { s.statusBackup = null; });
+      toast('그 뒤로 메시지가 바뀌어서 되돌릴 수 없어요.');
+      return;
+    }
+    target.data = backup.before;
+    await risuai.setChatToIndex(info.charIndex, info.chatIndex, chat);
+    const check = await risuai.getChatFromIndex(info.charIndex, info.chatIndex);
+    if (check?.message?.[backup.index]?.data !== backup.before) { toast('되돌리지 못했어요.'); return; }
+    await mutateCurrent((s) => {
+      s.statusBackup = null;
+      s.manualOrder = null;
+      syncFromChat(s, check, parseOwnTags(backup.before));
+    });
+    toast('상태창과 파티 순서를 고치기 전으로 되돌렸어요.');
+  }
+
+  // 패널 안 확인 창. 반환: true(예) / false(아니오)
+  function askConfirm(text, yes, no) {
+    return new Promise((resolve) => {
+      ui.confirm = { text, yes, no, resolve };
+      render();
+    });
+  }
+
+  function answerConfirm(value) {
+    const current = ui.confirm;
+    ui.confirm = null;
+    render();
+    current?.resolve(value);
+  }
+
+  async function toggleEditStatus() {
+    settings.editStatus = !settings.editStatus;
+    await saveSettings();
+    render();
   }
 
   // ---------- 상세 화면 기술 배치 ----------
@@ -2122,8 +2526,15 @@
 
   async function onClick(event) {
     const el = event.target.closest('[data-act]');
-    if (!el || ui.busy) return;
+    if (!el) return;
     const act = el.dataset.act;
+
+    // 확인 창이 떠 있으면 그 버튼만 받는다 (순서 저장 중이라 busy여도 받아야 한다)
+    if (ui.confirm) {
+      if (act === 'confirm-yes' || act === 'confirm-no') answerConfirm(act === 'confirm-yes');
+      return;
+    }
+    if (ui.busy) return;
 
     // 바깥 어두운 영역을 눌렀을 때만 닫기 (편집 중엔 실수 방지로 무시)
     if (act === 'backdrop') {
@@ -2158,6 +2569,11 @@
       case 'transfer': await transfer(); break;
       case 'aux-mon': await auxMon(); break;
       case 'aux-move': await auxMove(Number(el.dataset.i)); break;
+      case 'order-start': startOrdering(); break;
+      case 'order-cancel': cancelOrdering(); break;
+      case 'order-done': { const r = await commitOrder(); if (r.message) toast(r.message); break; }
+      case 'toggle-edit-status': await toggleEditStatus(); break;
+      case 'status-undo': await withBusy('상태창 되돌리는 중…', () => undoStatus()); break;
       default: break;
     }
   }
@@ -2188,11 +2604,131 @@
     if (ui.view === 'edit' && e.target?.dataset?.rerender) render();
   });
   document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && ui.confirm) { answerConfirm(false); return; }
     if (e.key === 'Escape' && !ui.busy) {
+      if (ui.ordering) {   // 순서 편집 중 Esc는 편집 취소
+        if (orderDrag) endOrderDrag();
+        cancelOrdering();
+        return;
+      }
       if (ui.view === 'edit') return;
       closePanel();
     }
   });
+
+  // ---------- 순서 바꾸기 드래그 ----------
+  // HTML5 drag는 터치에서 안 되므로 pointer 이벤트로 직접 만든다.
+  // 손가락은 카드 위쪽 손잡이로만 집는다 (손잡이에만 touch-action:none을 걸어 나머지 부분은 스크롤된다).
+  // 마우스는 카드 어디서든 집을 수 있다. 포인터 캡처는 움직이지 않는 grid에 걸어서,
+  // 카드를 DOM에서 옮겨도 캡처가 풀리지 않게 한다.
+  const ORDER_DRAG_THRESHOLD = 4;
+  const AUTO_SCROLL_EDGE = 70;
+
+  function onOrderPointerDown(e) {
+    if (!ui.ordering || orderDrag || ui.busy || ui.confirm || e.button > 0) return;
+    const card = e.target.closest?.('.card[data-oid]');
+    if (!card || e.target.closest('button')) return;
+    if (e.pointerType !== 'mouse' && !e.target.closest('.handle')) return;
+    e.preventDefault();
+    const grid = card.parentElement;
+    orderDrag = {
+      pointerId: e.pointerId, card, grid,
+      startX: e.clientX, startY: e.clientY, x: e.clientX, y: e.clientY,
+      active: false, ghost: null, offX: 0, offY: 0, timer: null,
+    };
+    try { grid.setPointerCapture(e.pointerId); } catch { /* 캡처를 못 걸어도 document 리스너로 받는다 */ }
+  }
+
+  function beginOrderDrag(d) {
+    const rect = d.card.getBoundingClientRect();
+    d.offX = d.startX - rect.left;
+    d.offY = d.startY - rect.top;
+    const ghost = d.card.cloneNode(true);
+    ghost.classList.add('ghost');
+    ghost.style.width = `${rect.width}px`;
+    ghost.style.height = `${rect.height}px`;
+    document.body.appendChild(ghost);
+    d.ghost = ghost;
+    d.card.classList.add('placeholder');
+    d.active = true;
+    moveGhost(d);
+    d.timer = setInterval(() => autoScrollOrder(d), 16);
+  }
+
+  function moveGhost(d) {
+    d.ghost.style.left = `${d.x - d.offX}px`;
+    d.ghost.style.top = `${d.y - d.offY}px`;
+  }
+
+  // 포인터 아래 카드 자리로 집은 카드를 옮긴다
+  function placeOrderCard(d) {
+    const cards = [...d.grid.querySelectorAll('.card[data-oid]')];
+    const target = cards.find((c) => {
+      if (c === d.card) return false;
+      const r = c.getBoundingClientRect();
+      return d.x >= r.left && d.x <= r.right && d.y >= r.top && d.y <= r.bottom;
+    });
+    if (!target) return;
+    const from = cards.indexOf(d.card);
+    const to = cards.indexOf(target);
+    d.grid.insertBefore(d.card, to > from ? target.nextSibling : target);
+  }
+
+  // 목록 위아래 가장자리에 가까우면 스크롤한다
+  function autoScrollOrder(d) {
+    const wrap = document.querySelector('.wrap');
+    if (!wrap || !d.active) return;
+    const h = window.innerHeight;
+    let step = 0;
+    if (d.y < AUTO_SCROLL_EDGE) step = -Math.ceil((AUTO_SCROLL_EDGE - d.y) / 6);
+    else if (d.y > h - AUTO_SCROLL_EDGE) step = Math.ceil((d.y - (h - AUTO_SCROLL_EDGE)) / 6);
+    if (!step) return;
+    wrap.scrollTop += step;
+    placeOrderCard(d);
+  }
+
+  function onOrderPointerMove(e) {
+    const d = orderDrag;
+    if (!d || e.pointerId !== d.pointerId) return;
+    // 버튼이 눌려 있지 않은데 움직이면 손을 뗀 신호를 놓친 것: 여기서 끝낸다 (1.1.6 몬스터볼 버그와 같은 대비)
+    if (e.buttons === 0) { endOrderDrag(); return; }
+    // 누른 사이 화면이 다시 그려져 카드가 사라졌으면 이번 드래그는 버린다
+    if (!d.active && !d.card.isConnected) { orderDrag = null; return; }
+    d.x = e.clientX;
+    d.y = e.clientY;
+    if (!d.active) {
+      if (Math.hypot(d.x - d.startX, d.y - d.startY) < ORDER_DRAG_THRESHOLD) return;
+      beginOrderDrag(d);
+    }
+    e.preventDefault();
+    moveGhost(d);
+    placeOrderCard(d);
+  }
+
+  function endOrderDrag() {
+    const d = orderDrag;
+    if (!d) return;
+    orderDrag = null;
+    clearInterval(d.timer);
+    d.ghost?.remove();
+    d.card.classList.remove('placeholder');
+    try {
+      if (d.grid.hasPointerCapture?.(d.pointerId)) d.grid.releasePointerCapture(d.pointerId);
+    } catch { /* 이미 풀린 경우 */ }
+    if (d.active && ui.ordering) {
+      ui.ordering.ids = [...d.grid.querySelectorAll('.card[data-oid]')].map((c) => c.dataset.oid);
+    }
+    if (d.active || ui.renderPending) render();
+  }
+
+  const onOrderPointerEnd = (e) => { if (orderDrag && e.pointerId === orderDrag.pointerId) endOrderDrag(); };
+  document.addEventListener('pointerdown', onOrderPointerDown);
+  document.addEventListener('pointermove', onOrderPointerMove);
+  document.addEventListener('pointerup', onOrderPointerEnd);
+  document.addEventListener('pointercancel', onOrderPointerEnd);
+  document.addEventListener('lostpointercapture', onOrderPointerEnd);
+  // iOS에서 카드를 끄는 동안 화면이 같이 스크롤되지 않게 막는다
+  document.addEventListener('touchmove', (e) => { if (orderDrag) e.preventDefault(); }, { passive: false });
   // 이미지가 없거나 깨지면 몬스터볼 그림으로 대체 (CSP 때문에 인라인 onerror 대신 캡처 리스너 사용)
   document.addEventListener('error', (e) => {
     const img = e.target;
@@ -2531,7 +3067,7 @@
       const visible = inChat && ((await showEverywhere()) || (await isYariPokeChat(charIndex)));
       await setButtonVisible(visible);
       // 패널을 연 채로 홈 화면으로 나가면 패널도 닫는다
-      if (!inChat && ui.open) await closePanel();
+      if (!inChat && ui.open) await closePanel({ force: true });
     } catch (err) {
       console.log(`[pokedex] 화면 확인 실패: ${err.message}`);
     } finally {
